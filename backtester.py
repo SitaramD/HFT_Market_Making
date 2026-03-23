@@ -814,7 +814,9 @@ class Backtester:
             log.warning(f"Day filter failed ({exc}), using full trade set")
             day_trades = all_trades
 
-        prev_mid = None
+        prev_mid   = None
+        daily_pnl  = 0.0   # running fee-adjusted PnL for this day
+        loss_limit = self.cfg.get('daily_loss_limit_usdt', None)
 
         for msg in self.loader.iter_ob_lines(ob_file):
             if not book.apply(msg):
@@ -904,8 +906,22 @@ class Backtester:
                 inventory, spread, signal, mid, forward_ret
             )
             if fill:
-                inventory = fill.inventory_after
+                inventory  = fill.inventory_after
                 fills.append(fill)
+                # Track daily fee-adjusted PnL for loss limit check
+                # sell fill = cash in (+notional), buy fill = cash out (-notional)
+                signed = fill.price * fill.quantity * (1.0 if fill.side == 'sell' else -1.0)
+                fee    = fill.price * fill.quantity * fill.fee_rate
+                daily_pnl += signed - fee
+
+            # Daily loss limit — stop quoting for rest of day if breached
+            if loss_limit is not None and daily_pnl < loss_limit:
+                log.info(
+                    f"  Daily loss limit hit on {date_str}: "
+                    f"PnL=${daily_pnl:,.0f} < limit=${loss_limit:,.0f} "
+                    f"— stopping quotes for remainder of day"
+                )
+                break
 
             prev_mid = mid
 

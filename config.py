@@ -48,7 +48,7 @@ STRATEGY = 'Avellaneda-Stoikov Market Making'
 #   Higher gamma = spread widens faster as inventory accumulates.
 #   Previous value of 0.50 was too low — quotes barely moved even at max inventory.
 #   At gamma=2.0 the model becomes much more defensive when inventory builds.
-AS_GAMMA = 5.0
+AS_GAMMA = 2.0      # reverted from 5.0 — higher gamma worsened IS drawdown
 
 # FIX-B: kappa lowered 1.5 -> 0.5
 #   Lower kappa = model assumes slower order arrival = wider base spread.
@@ -113,6 +113,20 @@ REGIME_VOL_THRESHOLD = 0.000045
 REGIME_SPREAD_MULT   = 3.0      # multiply AS half-spread when trending (fallback)
 
 # ---------------------------------------------------------------------------
+# DAILY LOSS LIMIT
+# Hard stop per calendar day. If cumulative PnL on that day falls below
+# this threshold the strategy stops quoting for the rest of the day.
+# This directly cuts IS drawdown without touching gamma or spread params.
+# Set to None or a very large negative number to disable.
+#
+# Rationale: IS drawdown of 39.85% in Run #6 was caused by 3-4 bad days
+# (Mar 02-03, Mar 07-09) where the strategy kept quoting into trending flow.
+# A $3,000/day stop would have limited each bad day's loss, cutting the
+# 13-day IS drawdown from ~40% to an estimated <10%.
+# ---------------------------------------------------------------------------
+DAILY_LOSS_LIMIT_USDT = -3000.0   # stop quoting if daily fee-adj PnL < -$3,000
+
+# ---------------------------------------------------------------------------
 # FUND THRESHOLDS (Tamara requirements)
 # ---------------------------------------------------------------------------
 SHARPE_TARGET      = 3.0
@@ -157,6 +171,7 @@ CONFIG = {
     'regime_vol_window'    : REGIME_VOL_WINDOW,
     'regime_vol_threshold' : REGIME_VOL_THRESHOLD,
     'regime_spread_mult'   : REGIME_SPREAD_MULT,
+    'daily_loss_limit_usdt': DAILY_LOSS_LIMIT_USDT,
     'sharpe_target'        : SHARPE_TARGET,
     'max_drawdown_limit'   : MAX_DRAWDOWN_LIMIT,
     'ic_min_threshold'     : IC_MIN_THRESHOLD,
