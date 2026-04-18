@@ -1,0 +1,20 @@
+
+# 08-04-2026
+powershell# 1. Stop everything cleanly
+# Ctrl+C on producer window
+# Ctrl+C on persister window  
+docker-compose down
+
+# 2. Restart fresh for US session
+docker-compose up -d
+python bybit_live_producer.py          # window 1
+docker exec -it sitaram-python-engine python /app/src/persister.py  # window 2
+
+# 3. Monitor dashboard
+# http://localhost:3321
+
+For Stopping the code:
+Control + C for Kafka producer code
+docker stop --timeout 60 sitaram-python-engine
+docker logs --tail 30 sitaram-python-engine
+docker logs sitaram-python-engine 2>&1 | Select-String "Signal|shutdown|gate|COMPLETED|session-logger|ERROR|Gate"

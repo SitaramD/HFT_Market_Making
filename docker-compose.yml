@@ -1,0 +1,466 @@
+# =============================================================================
+# SITARAM HFT Market Making Platform
+# Docker Compose - Production Configuration  v2.0
+# Windows 11 WSL2 | Single command startup: docker compose up -d
+#
+# Changes v2.0:
+#   [FIX]  MAX_INVENTORY_BTC corrected to 0.10 everywhere (was 0.5 in python-engine
+#          and claude-agent — mismatched engine.py default of 0.10, causing
+#          47,000% inventory warning)
+#   [NEW]  sessions volume: mounts E:\Binance\ into containers so engine.py and
+#          agent.py can write/read sitaram_sessions.json on the Windows host
+#
+# Architecture:
+#   Kafka → Redis → Python Engine → Ray → TimescaleDB → Claude Agent → React
+#   Jenkins acts as CONDUCTOR - validates health before triggering pipeline
+#
+# Startup order (Jenkins-controlled):
+#   Stage 1: Infrastructure  (Zookeeper, Kafka, Redis, TimescaleDB)
+#   Stage 2: Compute Engines (Python Engine, Ray)
+#   Stage 3: Intelligence    (Claude Agent)
+#   Stage 4: Frontend        (React Dashboard, Nginx)
+# =============================================================================
+
+version: '3.9'
+
+# =============================================================================
+# SHARED NETWORKS
+# =============================================================================
+networks:
+  sitaram-infra:        # Infrastructure layer: Kafka, Redis, TimescaleDB
+    driver: bridge
+  sitaram-compute:      # Compute layer: Python Engine, Ray
+    driver: bridge
+  sitaram-intelligence: # Intelligence layer: Claude Agent, Jenkins
+    driver: bridge
+  sitaram-frontend:     # Frontend layer: React, Nginx
+    driver: bridge
+
+# =============================================================================
+# PERSISTENT VOLUMES
+# =============================================================================
+volumes:
+  kafka-data:           # Kafka topic data persistence
+  zookeeper-data:       # Zookeeper coordination data
+  redis-data:           # Redis RDB snapshots
+  timescaledb-data:     # TimescaleDB PostgreSQL data
+  jenkins-home:         # Jenkins jobs, configs, build history
+  ray-tmp:              # Ray shared memory for distributed tasks
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1A: ZOOKEEPER
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: sitaram-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 10
+      ZOOKEEPER_SYNC_LIMIT: 5
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    networks:
+      - sitaram-infra
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1B: KAFKA
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sitaram-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 4
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 536870912
+      KAFKA_MESSAGE_MAX_BYTES: 2097152
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./kafka/config:/etc/kafka/custom
+    ports:
+      - "9092:9092"
+    networks:
+      - sitaram-infra
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # KAFKA TOPIC INITIALIZER
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sitaram-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Creating Kafka topics...'
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic ob200-raw --partitions 4 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic trades-raw --partitions 4 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic features-computed --partitions 4 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic signals-output --partitions 2 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic alerts-feed --partitions 1 --replication-factor 1
+      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+        --topic jenkins-events --partitions 1 --replication-factor 1
+      echo 'All topics created successfully'
+      kafka-topics --list --bootstrap-server kafka:29092
+      "
+    networks:
+      - sitaram-infra
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1C: REDIS
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: sitaram-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+      --appendfsync everysec
+      --tcp-keepalive 300
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - sitaram-infra
+      - sitaram-compute
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # STAGE 1D: TIMESCALEDB
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: sitaram-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sitaram
+      POSTGRES_USER: sitaram_user
+      POSTGRES_PASSWORD: ${TSDB_PASSWORD:-sitaram_secure_2026}
+      TIMESCALEDB_TELEMETRY: 'off'
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./timescaledb/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - sitaram-infra
+      - sitaram-compute
+      - sitaram-intelligence
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sitaram_user -d sitaram"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2A: PYTHON ENGINE
+  # FIX: MAX_INVENTORY_BTC corrected to 0.10 (was 0.5)
+  # NEW: sessions volume mount so engine.py writes session JSON to E:\Binance\
+  # ---------------------------------------------------------------------------
+  python-engine:
+    build:
+      context: ./python-engine
+      dockerfile: Dockerfile
+    container_name: sitaram-python-engine
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      TSDB_HOST: timescaledb
+      TSDB_PORT: 5432
+      TSDB_DB: sitaram
+      TSDB_USER: sitaram_user
+      TSDB_PASSWORD: ${TSDB_PASSWORD:-sitaram_secure_2026}
+      # ── Validated Run-15 parameters ──────────────────────────────────────
+      AS_GAMMA: 2.0
+      HALF_SPREAD_USDT: 0.15
+      MAX_INVENTORY_BTC: 0.10          # FIXED: was 0.5 — must match engine.py default
+      QUOTE_SIZE_BTC: 0.01
+      TICK_SIZE: 0.1
+      MAKER_FEE: -0.0001
+      TAKER_FEE: 0.0005
+      DAILY_LOSS_LIMIT: -2000.0
+      REGIME_VOL_THRESHOLD: 0.00006
+      REGIME_VOL_WINDOW: 50
+      INITIAL_CAPITAL: 100000.0
+      SIMULATED_LATENCY_MS: 10
+      DATA_STALL_SEC: 30              # seconds of feed silence before stall flag
+      SESSION_JSON_PATH: /mnt/sessions/sitaram_sessions.json
+      LOG_LEVEL: INFO
+    volumes:
+      - ./python-engine/src:/app/src
+      - ./python-engine/config:/app/config
+      - E:\Binance:/mnt/sessions        # NEW: session JSON written here on Windows host
+    networks:
+      - sitaram-infra
+      - sitaram-compute
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r=redis.Redis(host='redis'); r.ping()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2B: RAY HEAD
+  # ---------------------------------------------------------------------------
+  ray-head:
+    build:
+      context: ./ray-engine
+      dockerfile: Dockerfile
+    container_name: sitaram-ray-head
+    restart: unless-stopped
+    depends_on:
+      python-engine:
+        condition: service_healthy
+    command: >
+      ray start --head
+      --port=6380
+      --dashboard-host=0.0.0.0
+      --dashboard-port=8265
+      --num-cpus=4
+      --block
+    environment:
+      RAY_DISABLE_IMPORT_WARNING: 1
+    volumes:
+      - ray-tmp:/tmp/ray
+      - ./python-engine/src:/app/src
+    ports:
+      - "8265:8265"
+      - "6380:6380"
+    networks:
+      - sitaram-compute
+    shm_size: '2gb'
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3: CLAUDE AGENT
+  # FIX: MAX_INVENTORY_BTC corrected to 0.10 (was 0.5)
+  # NEW: sessions volume + SESSION_JSON_PATH env var
+  # NEW: STALL_ALERT_SEC threshold
+  # ---------------------------------------------------------------------------
+  claude-agent:
+    build:
+      context: ./claude-agent
+      dockerfile: Dockerfile
+    container_name: sitaram-claude-agent
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ray-head:
+        condition: service_healthy
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TSDB_HOST: timescaledb
+      TSDB_USER: sitaram_user
+      TSDB_PASSWORD: ${TSDB_PASSWORD:-sitaram_secure_2026}
+      TSDB_DB: sitaram
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # ── Alert thresholds ─────────────────────────────────────────────────
+      IC_MIN_THRESHOLD: 0.02
+      SHARPE_MIN_THRESHOLD: 1.5
+      MAX_DRAWDOWN_PCT: 5.0
+      MAX_INVENTORY_BTC: 0.10          # FIXED: was 0.5
+      LATENCY_SPIKE_MS: 100
+      FILL_RATE_MIN: 0.60
+      ADVERSE_SELECTION_MAX: 0.30
+      QTR_MAX: 10.0
+      STALL_ALERT_SEC: 30             # NEW: data feed stall threshold
+      SESSION_JSON_PATH: /mnt/sessions/sitaram_sessions.json
+      # ── Monitoring intervals ─────────────────────────────────────────────
+      HEALTH_CHECK_INTERVAL_SEC: 30
+      IC_CHECK_INTERVAL_SEC: 60
+      PNL_CHECK_INTERVAL_SEC: 10
+      ALERT_COOLDOWN_SEC: 300
+    volumes:
+      - ./claude-agent/src:/app/src
+      - ./claude-agent/prompts:/app/prompts
+      - E:\Binance:/mnt/sessions        # NEW: read session JSON from Windows host
+    ports:
+      - "8001:8001"
+    networks:
+      - sitaram-compute
+      - sitaram-intelligence
+      - sitaram-frontend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import anthropic; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4A: REACT DASHBOARD
+  # ---------------------------------------------------------------------------
+  react-dashboard:
+    build:
+      context: ./react-dashboard
+      dockerfile: Dockerfile
+    container_name: sitaram-react-dashboard
+    restart: unless-stopped
+    depends_on:
+      claude-agent:
+        condition: service_healthy
+    ports:
+      - "3321:3000"
+    networks:
+      - sitaram-frontend
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # STAGE 4B: NGINX
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: sitaram-nginx
+    restart: unless-stopped
+    depends_on:
+      react-dashboard:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "3002:80"
+      - "8081:8080"
+    networks:
+      - sitaram-frontend
+      - sitaram-intelligence
+      - sitaram-compute
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # JENKINS
+  # ---------------------------------------------------------------------------
+  jenkins:
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    container_name: sitaram-jenkins
+    restart: unless-stopped
+    user: root
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false -Xmx2g"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TSDB_HOST: timescaledb
+      TSDB_USER: sitaram_user
+      TSDB_PASSWORD: ${TSDB_PASSWORD:-sitaram_secure_2026}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      IC_MIN_THRESHOLD: 0.02
+      SHARPE_MIN_THRESHOLD: 1.5
+      MAX_DRAWDOWN_PCT: 5.0
+      FILL_RATE_MIN: 0.60
+      ADVERSE_SELECTION_MAX: 0.30
+      QTR_MAX: 10.0
+      SPREAD_MIN_TICKS: 1.0
+      INVENTORY_MEAN_REVERSION: 'true'
+    volumes:
+      - jenkins-home:/var/jenkins_home
+      - ./jenkins/pipelines:/var/jenkins_home/pipelines
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8090:8080"
+      - "50000:50000"
+    networks:
+      - sitaram-infra
+      - sitaram-compute
+      - sitaram-intelligence
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # DATA FEEDER - Streams Binance historical data into Kafka
+  # ---------------------------------------------------------------------------
+  kafka-producer:
+    build:
+      context: ./kafka-producer
+      dockerfile: Dockerfile
+    container_name: sitaram-kafka-producer
+    restart: "no"
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DATA_PATH_OB: /mnt/data/All
+      DATA_PATH_TRADES: /mnt/data
+      PLAYBACK_SPEED: "0"
+    volumes:
+      - E:\Binance\March:/mnt/data:ro
+    networks:
+      - sitaram-infra

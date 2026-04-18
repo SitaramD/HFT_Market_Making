@@ -1,0 +1,19 @@
+engine:
+  tick_size: 0.1
+  quote_size_btc: 0.01
+  max_inventory_btc: 0.5
+  maker_fee: -0.0001
+  taker_fee: 0.0005
+  simulated_latency_ms: 10
+
+features:
+  obi_levels: [3, 5, 10]
+  ic_horizons_ms: [200, 400, 600, 800, 1000]
+  tick_window: 200
+
+thresholds:
+  ic_min: 0.02
+  sharpe_min: 1.5
+  max_drawdown_pct: 5.0
+  fill_rate_min: 0.60
+  adverse_selection_max: 0.30

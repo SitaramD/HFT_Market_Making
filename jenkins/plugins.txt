@@ -1,0 +1,12 @@
+# Jenkins plugins required for SITARAM pipeline
+workflow-aggregator          # Pipeline support
+git                          # Git SCM
+pipeline-stage-view          # Visual pipeline stages
+ansicolor                    # Colored console output
+timestamper                  # Timestamps in logs
+build-timeout                # Kill hung builds
+credentials-binding          # Secret management
+docker-workflow              # Docker inside pipeline
+http_request                 # HTTP calls to services
+pipeline-utility-steps       # JSON/YAML parsing in pipeline
+junit                        # Test result publishing

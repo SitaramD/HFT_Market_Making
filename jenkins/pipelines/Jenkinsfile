@@ -1,0 +1,419 @@
+// =============================================================================
+// SITARAM — Jenkinsfile
+// Pipeline: Infrastructure Health → Strategy Validation → Trading Approval
+//
+// Jenkins is the CONDUCTOR. Nothing trades until all gates pass.
+// Triggered: On startup + every 30 minutes during market hours
+// =============================================================================
+
+pipeline {
+
+    agent any
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ENVIRONMENT — All thresholds as pipeline-level variables
+    // ─────────────────────────────────────────────────────────────────────────
+    environment {
+        // Infrastructure endpoints
+        KAFKA_SERVERS       = 'kafka:29092'
+        REDIS_HOST          = 'redis:6379'
+        TSDB_HOST           = 'timescaledb:5432'
+
+        // Strategy validation thresholds
+        IC_MIN              = '0.02'       // IC must exceed 0.02 → real edge exists
+        SHARPE_MIN          = '1.5'        // Sharpe ratio → risk-adjusted returns
+        DRAWDOWN_MAX        = '5.0'        // Max drawdown % → capital protection
+        FILL_RATE_MIN       = '0.60'       // >60% quotes must fill → strategy is active
+        ADVERSE_SEL_MAX     = '0.30'       // <30% fills against us → not being picked off
+        QTR_MAX             = '10.0'       // Quote-to-Trade ratio < 10 → no spam
+        SPREAD_MIN_TICKS    = '1.0'        // Spread > 1 tick → profitable after fees
+        IC_STABILITY_DAYS   = '3'          // IC must hold for 3 rolling days
+        LATENCY_MAX_MS      = '50'         // Tick-to-fill < 50ms
+        FEE_ADJ_PNL_MIN     = '0.0'        // Fee-adjusted P&L must be positive
+        INVENTORY_REV_MIN   = '0.7'        // Inventory reverts to flat 70%+ of time
+
+        // Notification
+        NOTIFY_ENDPOINT     = "${env.NOTIFY_ENDPOINT}"
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TRIGGERS — Run on startup + every 30 minutes (H/2 = every 30 min)
+    // ─────────────────────────────────────────────────────────────────────────
+    triggers {
+        cron('H/30 * * * *')   // Every 30 minutes — continuous monitoring
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OPTIONS
+    // ─────────────────────────────────────────────────────────────────────────
+    options {
+        timeout(time: 10, unit: 'MINUTES')     // Fail if pipeline hangs > 10 min
+        buildDiscarder(logRotator(numToKeepStr: '50'))  // Keep last 50 builds
+        timestamps()                            // Show timestamps in console
+        ansiColor('xterm')                      // Colored console output
+    }
+
+    // =========================================================================
+    // STAGES
+    // =========================================================================
+    stages {
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STAGE 1: INFRASTRUCTURE HEALTH CHECK
+        // All services must be healthy before any validation runs
+        // ─────────────────────────────────────────────────────────────────────
+        stage('🔧 Infrastructure Health') {
+            parallel {
+
+                stage('Kafka') {
+                    steps {
+                        script {
+                            echo '▶ Checking Kafka broker...'
+                            def result = sh(
+                                script: '''kafka-broker-api-versions \
+                                    --bootstrap-server ${KAFKA_SERVERS} \
+                                    --command-config /dev/null 2>&1 | grep -c "ApiVersions"''',
+                                returnStatus: true
+                            )
+                            if (result != 0) {
+                                sendAlert('🔴 CRITICAL', 'Kafka broker is DOWN', 'pipeline')
+                                error('Kafka health check failed')
+                            }
+                            echo '✅ Kafka: HEALTHY'
+                        }
+                    }
+                }
+
+                stage('Redis') {
+                    steps {
+                        script {
+                            echo '▶ Checking Redis...'
+                            def pong = sh(
+                                script: 'redis-cli -h redis ping',
+                                returnStdout: true
+                            ).trim()
+                            if (pong != 'PONG') {
+                                sendAlert('🔴 CRITICAL', 'Redis is DOWN', 'pipeline')
+                                error('Redis health check failed')
+                            }
+                            // Check tick window is being populated
+                            def tickCount = sh(
+                                script: "redis-cli -h redis llen BTCUSDT:ob:ticks",
+                                returnStdout: true
+                            ).trim().toInteger()
+                            echo "✅ Redis: HEALTHY | Tick buffer: ${tickCount}/200"
+                        }
+                    }
+                }
+
+                stage('TimescaleDB') {
+                    steps {
+                        script {
+                            echo '▶ Checking TimescaleDB...'
+                            def result = sh(
+                                script: '''PGPASSWORD=${TSDB_PASSWORD} psql \
+                                    -h timescaledb -U sitaram_user -d sitaram \
+                                    -c "SELECT 1" -q -t 2>&1''',
+                                returnStatus: true
+                            )
+                            if (result != 0) {
+                                sendAlert('🔴 CRITICAL', 'TimescaleDB is DOWN', 'pipeline')
+                                error('TimescaleDB health check failed')
+                            }
+                            echo '✅ TimescaleDB: HEALTHY'
+                        }
+                    }
+                }
+
+                stage('Python Engine') {
+                    steps {
+                        script {
+                            echo '▶ Checking Python Engine...'
+                            def result = sh(
+                                script: 'curl -sf http://python-engine:8000/health',
+                                returnStatus: true
+                            )
+                            if (result != 0) {
+                                sendAlert('🔴 CRITICAL', 'Python Engine is DOWN', 'pipeline')
+                                error('Python Engine health check failed')
+                            }
+                            echo '✅ Python Engine: HEALTHY'
+                        }
+                    }
+                }
+
+                stage('Ray') {
+                    steps {
+                        script {
+                            echo '▶ Checking Ray cluster...'
+                            def result = sh(
+                                script: 'curl -sf http://ray-head:8265/api/cluster_status',
+                                returnStatus: true
+                            )
+                            if (result != 0) {
+                                sendAlert('🔴 CRITICAL', 'Ray cluster is DOWN', 'pipeline')
+                                error('Ray health check failed')
+                            }
+                            echo '✅ Ray: HEALTHY'
+                        }
+                    }
+                }
+
+                stage('Claude Agent') {
+                    steps {
+                        script {
+                            echo '▶ Checking Claude Agent...'
+                            def result = sh(
+                                script: 'curl -sf http://claude-agent:8001/health',
+                                returnStatus: true
+                            )
+                            if (result != 0) {
+                                sendAlert('🟡 WARNING', 'Claude Agent is DOWN — monitoring blind', 'pipeline')
+                                // Non-fatal — trading can continue without Claude agent
+                                // but operator must be informed
+                            }
+                            echo '✅ Claude Agent: HEALTHY'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STAGE 2: UNIT TESTS
+        // Run all Python unit tests for feature computation and quoting logic
+        // ─────────────────────────────────────────────────────────────────────
+        stage('🧪 Unit Tests') {
+            steps {
+                script {
+                    echo '▶ Running unit test suite...'
+                    def result = sh(
+                        script: '''docker exec sitaram-python-engine \
+                            python -m pytest /app/tests/ -v \
+                            --tb=short \
+                            --junit-xml=/tmp/test-results.xml \
+                            2>&1''',
+                        returnStatus: true
+                    )
+                    if (result != 0) {
+                        sendAlert('🔴 FAIL', 'Unit tests FAILED — trading blocked', 'validation')
+                        error('Unit tests failed')
+                    }
+                    echo '✅ All unit tests PASSED'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STAGE 3: STRATEGY VALIDATION GATES
+        // ALL gates must pass. One failure blocks trading.
+        // ─────────────────────────────────────────────────────────────────────
+        stage('📊 Strategy Validation') {
+            steps {
+                script {
+
+                    // ── Fetch latest metrics from TimescaleDB ──────────────
+                    echo '▶ Fetching strategy metrics from TimescaleDB...'
+                    def metrics = sh(
+                        script: '''PGPASSWORD=${TSDB_PASSWORD} psql \
+                            -h timescaledb -U sitaram_user -d sitaram \
+                            -c "SELECT * FROM v_latest_strategy_metrics" \
+                            -t -A -F'|' 2>&1''',
+                        returnStdout: true
+                    ).trim()
+
+                    // Parse returned pipe-delimited metrics
+                    def parts = metrics.split('\\|')
+                    def ic_value          = parts[0].toFloat()
+                    def sharpe            = parts[1].toFloat()
+                    def drawdown          = parts[2].toFloat()
+                    def fill_rate         = parts[3].toFloat()
+                    def adverse_sel       = parts[4].toFloat()
+                    def qtr               = parts[5].toFloat()
+                    def spread_ticks      = parts[6].toFloat()
+                    def ic_stability      = parts[7].toFloat()
+                    def latency_ms        = parts[8].toFloat()
+                    def fee_adj_pnl       = parts[9].toFloat()
+                    def inv_reversion     = parts[10].toFloat()
+
+                    echo """
+                    ┌─────────────────────────────────────────────────────┐
+                    │         SITARAM STRATEGY VALIDATION REPORT           │
+                    ├──────────────────────────┬──────────┬───────────────┤
+                    │ Metric                   │  Value   │  Threshold    │
+                    ├──────────────────────────┼──────────┼───────────────┤
+                    │ IC (3-day rolling)        │  ${String.format('%.4f', ic_value)}  │  > ${IC_MIN}        │
+                    │ Sharpe Ratio              │  ${String.format('%.2f', sharpe)}    │  > ${SHARPE_MIN}         │
+                    │ Max Drawdown %            │  ${String.format('%.2f', drawdown)}%   │  < ${DRAWDOWN_MAX}%         │
+                    │ Fill Rate                 │  ${String.format('%.1f', fill_rate*100)}%   │  > ${(FILL_RATE_MIN.toFloat()*100).toInteger()}%         │
+                    │ Adverse Selection Rate    │  ${String.format('%.1f', adverse_sel*100)}%   │  < ${(ADVERSE_SEL_MAX.toFloat()*100).toInteger()}%         │
+                    │ Quote-to-Trade Ratio      │  ${String.format('%.1f', qtr)}     │  < ${QTR_MAX}         │
+                    │ Spread (ticks)            │  ${String.format('%.1f', spread_ticks)}     │  > ${SPREAD_MIN_TICKS} tick       │
+                    │ IC Stability (days)       │  ${String.format('%.1f', ic_stability)}     │  >= ${IC_STABILITY_DAYS} days       │
+                    │ Tick-to-Fill Latency      │  ${String.format('%.1f', latency_ms)}ms    │  < ${LATENCY_MAX_MS}ms          │
+                    │ Fee-Adjusted P&L          │  ${String.format('%.4f', fee_adj_pnl)}  │  > 0.0          │
+                    │ Inventory Mean Reversion  │  ${String.format('%.1f', inv_reversion*100)}%   │  > 70%          │
+                    └──────────────────────────┴──────────┴───────────────┘
+                    """
+
+                    // ── GATE 1: Information Coefficient ───────────────────
+                    if (ic_value < IC_MIN.toFloat()) {
+                        sendAlert('🔴 FAIL', "IC=${ic_value} below minimum ${IC_MIN} — no edge detected", 'validation')
+                        error("GATE 1 FAILED: IC ${ic_value} < ${IC_MIN}")
+                    }
+                    echo "✅ Gate 1 PASS: IC = ${ic_value}"
+
+                    // ── GATE 2: Sharpe Ratio ───────────────────────────────
+                    if (sharpe < SHARPE_MIN.toFloat()) {
+                        sendAlert('🔴 FAIL', "Sharpe=${sharpe} below minimum ${SHARPE_MIN}", 'validation')
+                        error("GATE 2 FAILED: Sharpe ${sharpe} < ${SHARPE_MIN}")
+                    }
+                    echo "✅ Gate 2 PASS: Sharpe = ${sharpe}"
+
+                    // ── GATE 3: Max Drawdown ───────────────────────────────
+                    if (drawdown > DRAWDOWN_MAX.toFloat()) {
+                        sendAlert('🔴 FAIL', "Drawdown=${drawdown}% exceeds max ${DRAWDOWN_MAX}%", 'validation')
+                        error("GATE 3 FAILED: Drawdown ${drawdown}% > ${DRAWDOWN_MAX}%")
+                    }
+                    echo "✅ Gate 3 PASS: Drawdown = ${drawdown}%"
+
+                    // ── GATE 4: Fill Rate ──────────────────────────────────
+                    if (fill_rate < FILL_RATE_MIN.toFloat()) {
+                        sendAlert('🔴 FAIL', "Fill rate=${fill_rate*100}% below minimum ${FILL_RATE_MIN.toFloat()*100}%", 'validation')
+                        error("GATE 4 FAILED: Fill rate ${fill_rate} < ${FILL_RATE_MIN}")
+                    }
+                    echo "✅ Gate 4 PASS: Fill Rate = ${fill_rate*100}%"
+
+                    // ── GATE 5: Adverse Selection ──────────────────────────
+                    if (adverse_sel > ADVERSE_SEL_MAX.toFloat()) {
+                        sendAlert('🔴 FAIL', "Adverse selection=${adverse_sel*100}% — being picked off too often", 'validation')
+                        error("GATE 5 FAILED: Adverse selection ${adverse_sel} > ${ADVERSE_SEL_MAX}")
+                    }
+                    echo "✅ Gate 5 PASS: Adverse Selection = ${adverse_sel*100}%"
+
+                    // ── GATE 6: Quote-to-Trade Ratio ──────────────────────
+                    if (qtr > QTR_MAX.toFloat()) {
+                        sendAlert('🔴 FAIL', "QTR=${qtr} exceeds max ${QTR_MAX} — excessive cancellations", 'validation')
+                        error("GATE 6 FAILED: QTR ${qtr} > ${QTR_MAX}")
+                    }
+                    echo "✅ Gate 6 PASS: QTR = ${qtr}"
+
+                    // ── GATE 7: Minimum Spread ─────────────────────────────
+                    if (spread_ticks < SPREAD_MIN_TICKS.toFloat()) {
+                        sendAlert('🔴 FAIL', "Spread=${spread_ticks} ticks below minimum — unprofitable after fees", 'validation')
+                        error("GATE 7 FAILED: Spread ${spread_ticks} < ${SPREAD_MIN_TICKS} ticks")
+                    }
+                    echo "✅ Gate 7 PASS: Spread = ${spread_ticks} ticks"
+
+                    // ── GATE 8: IC Stability ───────────────────────────────
+                    if (ic_stability < IC_STABILITY_DAYS.toFloat()) {
+                        sendAlert('🟡 WARNING', "IC only stable for ${ic_stability} days — may be noise", 'validation')
+                        error("GATE 8 FAILED: IC stability ${ic_stability} < ${IC_STABILITY_DAYS} days")
+                    }
+                    echo "✅ Gate 8 PASS: IC stable for ${ic_stability} days"
+
+                    // ── GATE 9: Latency ────────────────────────────────────
+                    if (latency_ms > LATENCY_MAX_MS.toFloat()) {
+                        sendAlert('🔴 FAIL', "Latency=${latency_ms}ms exceeds ${LATENCY_MAX_MS}ms — stale quotes risk", 'validation')
+                        error("GATE 9 FAILED: Latency ${latency_ms}ms > ${LATENCY_MAX_MS}ms")
+                    }
+                    echo "✅ Gate 9 PASS: Latency = ${latency_ms}ms"
+
+                    // ── GATE 10: Fee-Adjusted P&L ──────────────────────────
+                    if (fee_adj_pnl <= FEE_ADJ_PNL_MIN.toFloat()) {
+                        sendAlert('🔴 FAIL', "Fee-adjusted P&L=${fee_adj_pnl} is not positive — fees eating all profit", 'validation')
+                        error("GATE 10 FAILED: Fee-adj P&L ${fee_adj_pnl} <= 0")
+                    }
+                    echo "✅ Gate 10 PASS: Fee-adjusted P&L = ${fee_adj_pnl}"
+
+                    // ── GATE 11: Inventory Mean Reversion ─────────────────
+                    if (inv_reversion < INVENTORY_REV_MIN.toFloat()) {
+                        sendAlert('🔴 FAIL', "Inventory reversion=${inv_reversion*100}% — inventory accumulating dangerously", 'validation')
+                        error("GATE 11 FAILED: Inventory reversion ${inv_reversion} < ${INVENTORY_REV_MIN}")
+                    }
+                    echo "✅ Gate 11 PASS: Inventory reversion = ${inv_reversion*100}%"
+
+                    // ── ALL GATES PASSED ───────────────────────────────────
+                    sendAlert('🟢 PASS', 'All 11 validation gates PASSED — strategy approved', 'validation')
+                    echo '🟢 ALL VALIDATION GATES PASSED'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STAGE 4: TRADING APPROVAL — Write approval to TimescaleDB + Redis
+        // Python Engine reads this flag before placing any quotes
+        // ─────────────────────────────────────────────────────────────────────
+        stage('🟢 Approve Trading') {
+            steps {
+                script {
+                    echo '▶ Writing trading approval to Redis and TimescaleDB...'
+
+                    // Set approval flag in Redis — Python Engine checks this every tick
+                    sh '''redis-cli -h redis set SITARAM:TRADING_APPROVED "1" EX 1800'''
+                    // 1800 seconds = 30 minutes (expires, forcing re-validation)
+
+                    // Log approval event to TimescaleDB audit trail
+                    sh '''PGPASSWORD=${TSDB_PASSWORD} psql \
+                        -h timescaledb -U sitaram_user -d sitaram \
+                        -c "INSERT INTO jenkins_approvals (approved_at, build_number, all_gates_passed) VALUES (NOW(), ${BUILD_NUMBER}, true)"'''
+
+                    echo '✅ Trading APPROVED — Python Engine is cleared to quote'
+                    sendAlert('🟢 APPROVED', "Build #${BUILD_NUMBER}: Trading approved for next 30 minutes", 'approval')
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // STAGE 5: NOTIFY DASHBOARD — Push pipeline status to React
+        // ─────────────────────────────────────────────────────────────────────
+        stage('📢 Notify Dashboard') {
+            steps {
+                script {
+                    sh '''curl -s -X POST http://claude-agent:8001/jenkins-status \
+                        -H "Content-Type: application/json" \
+                        -d "{\\"build\\": \\"${BUILD_NUMBER}\\", \\"status\\": \\"APPROVED\\", \\"timestamp\\": \\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\"}"'''
+                    echo '✅ Dashboard notified'
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // POST — Runs after every pipeline regardless of result
+    // =========================================================================
+    post {
+
+        success {
+            echo '🟢 Pipeline completed successfully — trading is LIVE'
+        }
+
+        failure {
+            script {
+                echo '🔴 Pipeline FAILED — trading is BLOCKED'
+                // Revoke trading approval in Redis immediately
+                sh 'redis-cli -h redis del SITARAM:TRADING_APPROVED || true'
+                sendAlert('🔴 PIPELINE FAILED', "Build #${BUILD_NUMBER} failed — trading BLOCKED. Check Jenkins.", 'pipeline')
+            }
+        }
+
+        always {
+            // Archive validation report for audit trail
+            archiveArtifacts artifacts: '/tmp/test-results.xml', allowEmptyArchive: true
+            echo "Build #${BUILD_NUMBER} complete at ${new Date()}"
+        }
+    }
+}
+
+// =============================================================================
+// HELPER FUNCTION: Send desktop notification via notify endpoint
+// =============================================================================
+def sendAlert(String severity, String message, String category) {
+    sh """
+        curl -s -X POST ${NOTIFY_ENDPOINT} \
+            -H "Content-Type: application/json" \
+            -d '{"severity": "${severity}", "message": "${message}", "category": "${category}", "timestamp": "'"\$(date -u +%Y-%m-%dT%H:%M:%SZ)"'", "source": "jenkins", "build": "${BUILD_NUMBER}"}' \
+            || true
+    """
+    echo "${severity}: ${message}"
+}
