@@ -59,8 +59,8 @@ pipeline {
             steps {
                 echo '⚙️  Installing Python dependencies...'
                 sh '''
-                    pip install --quiet --upgrade pip
-                    pip install --quiet \
+                    pip install --quiet --upgrade pip --break-                    system-packages
+                    pip install --quiet --break-system-packages \
                         pytest pytest-cov pytest-html pytest-xdist \
                         hypothesis \
                         redis \
@@ -225,14 +225,7 @@ except Exception as e:
         always {
             echo '📦  Archiving reports...'
             archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
-            publishHTML([
-                allowMissing: true,
-                alwaysLinkToLastBuild: true,
-                keepAll: true,
-                reportDir: "${COV_HTML}/unit",
-                reportFiles: 'index.html',
-                reportName: 'Unit Test Coverage'
-            ])
+            
         }
         success {
             echo '🎉  Pipeline PASSED — all tests green'
