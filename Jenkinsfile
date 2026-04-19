@@ -46,7 +46,7 @@ pipeline {
             steps {
                 echo '⚙️  Installing Python dependencies...'
                 sh '''
-                    pip install --quiet --upgrade pip --break-system-packages
+                    echo "Skipping pip upgrade"
                     pip install --quiet --break-system-packages pytest pytest-cov pytest-xdist hypothesis redis psycopg2-binary numpy pandas colorama
                     mkdir -p reports
                 '''
@@ -156,3 +156,4 @@ pipeline {
         }
     }
 }
+
