@@ -47,7 +47,7 @@ pipeline {
                 echo '⚙️  Installing Python dependencies...'
                 sh '''
                     echo "Skipping pip upgrade"
-                    pip install --quiet --break-system-packages pytest pytest-cov pytest-xdist hypothesis redis psycopg2-binary numpy pandas colorama
+                    pip install --quiet --break-system-packages pytest pytest-cov pytest-xdist hypothesis redis psycopg2-binary numpy pandas requests colorama
                     mkdir -p reports
                 '''
             }
@@ -90,7 +90,7 @@ pipeline {
             steps {
                 echo '🔗  Running integration tests against live Docker stack...'
                 sh '''
-                    python -c "import redis, sys; r = redis.Redis(host='${REDIS_HOST}', port=${REDIS_PORT}, socket_timeout=3); r.ping(); print('✅ Redis reachable')" || true
+                    python3 -c "import redis, sys; r = redis.Redis(host='${REDIS_HOST}', port=${REDIS_PORT}, socket_timeout=3); r.ping(); print('✅ Redis reachable')" || true
                     pytest tests/integration/ -v --tb=short --junitxml=${JUNIT_INTG} -q || true
                 '''
             }
@@ -116,7 +116,7 @@ pipeline {
             steps {
                 echo '🚦  Evaluating Go-Live gates (ADVISORY — no block)...'
                 sh '''
-                    python scripts/gate_evaluator.py \
+                    python3 scripts/gate_evaluator.py \
                         --sharpe-target ${SHARPE_TARGET} \
                         --max-dd ${MAX_DD_PCT} \
                         --fill-rate-min ${FILL_RATE_MIN} \
