@@ -121,25 +121,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command: |
-      "
-      echo 'Creating Kafka topics...'
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic ob200-raw --partitions 4 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic trades-raw --partitions 4 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic features-computed --partitions 4 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic signals-output --partitions 2 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic alerts-feed --partitions 1 --replication-factor 1
-      kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
-        --topic jenkins-events --partitions 1 --replication-factor 1
-      echo 'All topics created successfully'
-      kafka-topics --list --bootstrap-server kafka:29092
-      "
+    entrypoint: ["/bin/bash", "/tmp/init-topics.sh"]
+    volumes:
+      - ./kafka/init-topics.sh:/tmp/init-topics.sh:ro
     networks:
       - sitaram-infra
     restart: on-failure
@@ -412,7 +396,7 @@ services:
     restart: unless-stopped
     user: root
     environment:
-      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false -Xmx2g"
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false -Xmx2g -Dhudson.plugins.git.GitSCM.ALLOW_LOCAL_CHECKOUT=true"
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       TSDB_HOST: timescaledb
       TSDB_USER: sitaram_user
@@ -429,6 +413,7 @@ services:
     volumes:
       - jenkins-home:/var/jenkins_home
       - ./jenkins/pipelines:/var/jenkins_home/pipelines
+      - D:/1/Project/Trading_Strategy/sitaram:/workspace/sitaram
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8090:8080"
@@ -464,3 +449,4 @@ services:
       - E:\Binance\March:/mnt/data:ro
     networks:
       - sitaram-infra
+

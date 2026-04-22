@@ -31,6 +31,14 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
+# Layer 3: Kafka heartbeat consumer
+try:
+    from kafka import KafkaConsumer
+    from kafka.errors import NoBrokersAvailable
+    KAFKA_AVAILABLE = True
+except ImportError:
+    KAFKA_AVAILABLE = False
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -64,6 +72,12 @@ IC_INTERVAL       = int(os.getenv('IC_CHECK_INTERVAL_SEC', '60'))
 PNL_INTERVAL      = int(os.getenv('PNL_CHECK_INTERVAL_SEC', '10'))
 ALERT_COOLDOWN    = int(os.getenv('ALERT_COOLDOWN_SEC', '300'))
 STALL_ALERT_SEC   = float(os.getenv('STALL_ALERT_SEC', '30'))   # seconds of silence → alert
+STALL_COOLDOWN    = int(os.getenv('STALL_COOLDOWN_SEC', '120'))  # Layer 3: shorter cooldown for feed/heartbeat alerts
+
+# Layer 3: Kafka heartbeat consumer config
+KAFKA_BOOTSTRAP       = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
+HEARTBEAT_TOPIC       = 'sitaram.heartbeat'
+HEARTBEAT_TIMEOUT_SEC = float(os.getenv('HEARTBEAT_TIMEOUT_SEC', '30'))  # alert if no heartbeat for this long
 
 # Path to session JSON (mounted from host E:\Binance\)
 SESSION_JSON_PATH = os.getenv('SESSION_JSON_PATH', '/mnt/sessions/sitaram_sessions.json')
@@ -536,20 +550,96 @@ def monitor_data_feed():
                     f'DATA FEED STALLED since {stall_since} '
                     f'(age: {data_age_sec:.0f}s)',
                     analysis, feed_metrics)
-                mark_alert_sent('data_feed_stall')
+                alert_cooldowns['data_feed_stall'] = time.time() - (ALERT_COOLDOWN - STALL_COOLDOWN)
 
             # Also alert if data age exceeds threshold even without stall flag
             if data_age_sec > STALL_ALERT_SEC and not is_on_cooldown('data_age_high'):
                 dispatch_alert('WARNING', 'FEED',
                     f'Data age high: {data_age_sec:.0f}s (threshold: {STALL_ALERT_SEC}s)',
                     None, feed_metrics)
-                mark_alert_sent('data_age_high')
+                alert_cooldowns['data_age_high'] = time.time() - (ALERT_COOLDOWN - STALL_COOLDOWN)
 
             socketio.emit('feed_status', feed_metrics, namespace='/dashboard')
 
         except Exception as e:
             log.error(f'Data feed monitor error: {e}')
         time.sleep(15)
+
+# =============================================================================
+# MONITOR 7 (NEW): LAYER 3 HEARTBEAT CONSUMER
+# Consumes 'sitaram.heartbeat' Kafka topic published by bybit_live_producer.py
+# every 10s. If gap between heartbeats exceeds HEARTBEAT_TIMEOUT_SEC, the
+# producer process has died — even if ob:ts looks fresh (engine still running).
+# This is the only monitor that can distinguish "engine alive, producer dead".
+# =============================================================================
+def monitor_heartbeat():
+    if not KAFKA_AVAILABLE:
+        log.warning('kafka-python not installed — heartbeat monitor disabled')
+        return
+
+    log.info(f'Heartbeat monitor started — consuming {HEARTBEAT_TOPIC} from {KAFKA_BOOTSTRAP}')
+    last_heartbeat_ts = time.time()   # assume alive at startup
+    consumer = None
+
+    while True:
+        try:
+            if consumer is None:
+                consumer = KafkaConsumer(
+                    HEARTBEAT_TOPIC,
+                    bootstrap_servers=KAFKA_BOOTSTRAP,
+                    group_id='claude-agent-heartbeat',
+                    auto_offset_reset='latest',
+                    enable_auto_commit=True,
+                    consumer_timeout_ms=5000,   # non-blocking poll
+                    value_deserializer=lambda v: json.loads(v.decode('utf-8')),
+                )
+                log.info('Heartbeat Kafka consumer connected')
+
+            # Poll for up to 5s
+            for msg in consumer:
+                hb = msg.value
+                last_heartbeat_ts = time.time()
+                ob_connected    = hb.get('ob_connected', False)
+                trade_connected = hb.get('trade_connected', False)
+                uptime          = hb.get('uptime_sec', 0)
+                # Emit live producer status to dashboard
+                socketio.emit('heartbeat', {
+                    'ts'             : hb.get('ts'),
+                    'ob_connected'   : ob_connected,
+                    'trade_connected': trade_connected,
+                    'ob_msgs'        : hb.get('ob_msgs', 0),
+                    'trade_msgs'     : hb.get('trade_msgs', 0),
+                    'uptime_sec'     : uptime,
+                    'last_seen'      : datetime.now(timezone.utc).isoformat(),
+                }, namespace='/dashboard')
+
+            # Check gap since last heartbeat
+            gap = time.time() - last_heartbeat_ts
+            if gap > HEARTBEAT_TIMEOUT_SEC and not is_on_cooldown('heartbeat_missing'):
+                metrics = {
+                    'gap_sec'           : round(gap, 1),
+                    'timeout_sec'       : HEARTBEAT_TIMEOUT_SEC,
+                    'last_heartbeat_ago': round(gap, 1),
+                    'topic'             : HEARTBEAT_TOPIC,
+                }
+                analysis = ask_claude(metrics,
+                    f'Producer heartbeat missing for {gap:.0f}s — bybit_live_producer.py may have died')
+                dispatch_alert('CRITICAL', 'FEED',
+                    f'PRODUCER HEARTBEAT LOST: no signal for {gap:.0f}s '
+                    f'(threshold: {HEARTBEAT_TIMEOUT_SEC}s). '
+                    f'Restart bybit_live_producer.py.',
+                    analysis, metrics)
+                alert_cooldowns['heartbeat_missing'] = time.time() - (ALERT_COOLDOWN - STALL_COOLDOWN)
+
+        except Exception as e:
+            log.error(f'Heartbeat monitor error: {e} — reconnecting in 15s')
+            try:
+                if consumer:
+                    consumer.close()
+            except Exception:
+                pass
+            consumer = None
+            time.sleep(15)
 
 # =============================================================================
 # HTTP ENDPOINTS
@@ -637,12 +727,13 @@ if __name__ == '__main__':
     log.info('🧠 SITARAM Claude Intelligence Agent v2.0 starting...')
 
     monitors = [
-        threading.Thread(target=monitor_ic,        name='IC-Monitor',       daemon=True),
-        threading.Thread(target=monitor_inventory, name='Inventory-Monitor', daemon=True),
-        threading.Thread(target=monitor_pnl,       name='PnL-Monitor',      daemon=True),
-        threading.Thread(target=monitor_pipeline,  name='Pipeline-Monitor',  daemon=True),
-        threading.Thread(target=monitor_halts,     name='Halt-Monitor',      daemon=True),  # NEW
-        threading.Thread(target=monitor_data_feed, name='Feed-Monitor',      daemon=True),  # NEW
+        threading.Thread(target=monitor_ic,        name='IC-Monitor',        daemon=True),
+        threading.Thread(target=monitor_inventory, name='Inventory-Monitor',  daemon=True),
+        threading.Thread(target=monitor_pnl,       name='PnL-Monitor',       daemon=True),
+        threading.Thread(target=monitor_pipeline,  name='Pipeline-Monitor',   daemon=True),
+        threading.Thread(target=monitor_halts,     name='Halt-Monitor',       daemon=True),
+        threading.Thread(target=monitor_data_feed, name='Feed-Monitor',       daemon=True),
+        threading.Thread(target=monitor_heartbeat, name='Heartbeat-Monitor',  daemon=True),  # NEW Layer 3
     ]
     for t in monitors:
         t.start()
@@ -655,6 +746,9 @@ if __name__ == '__main__':
     log.info(f'   Latency spike    : {LATENCY_SPIKE_MS}ms')
     log.info(f'   Alert cooldown   : {ALERT_COOLDOWN}s')
     log.info(f'   Stall threshold  : {STALL_ALERT_SEC}s')
+    log.info(f'   Stall cooldown   : {STALL_COOLDOWN}s (faster re-alert for feed issues)')
+    log.info(f'   Heartbeat timeout: {HEARTBEAT_TIMEOUT_SEC}s')
+    log.info(f'   Heartbeat topic  : {HEARTBEAT_TOPIC}')
     log.info(f'   Session history  : {SESSION_JSON_PATH}')
 
     socketio.run(app, host='0.0.0.0', port=8001)

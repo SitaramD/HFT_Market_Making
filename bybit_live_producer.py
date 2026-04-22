@@ -64,8 +64,9 @@ PING_INTERVAL_S     = 20
 RECONNECT_DELAY_S   = 5    # base delay between reconnect attempts
 MAX_RECONNECT_S     = 60   # cap backoff at 60s
 
-TOPIC_OB     = "ob200-raw"
-TOPIC_TRADES = "trades-raw"
+TOPIC_OB        = "ob200-raw"
+TOPIC_TRADES    = "trades-raw"
+TOPIC_HEARTBEAT = "sitaram.heartbeat"   # Layer 3: producer liveness signal
 
 APP_NAME     = "SITARAM HFT"
 
@@ -291,8 +292,36 @@ def halt_event_poller():
                     log.warning(f"Halt event parse error: {e}")
         except Exception as e:
             log.warning(f"Halt poller Redis error: {e} — reconnecting in 10s")
-            _redis_client = None   # force reconnect
+            global _redis_client
+            _redis_client = None   # force reconnect (must be global to actually clear it)
             time.sleep(10)
+
+# =============================================================================
+# LAYER 3: HEARTBEAT PUBLISHER
+# Publishes a liveness signal to Kafka topic 'sitaram.heartbeat' every 10s.
+# The claude-agent consumes this topic in monitor_heartbeat() to detect producer
+# death independently of ob:ts (which only proves the engine is writing Redis,
+# not that fresh Bybit data is actually flowing).
+# =============================================================================
+def heartbeat_publisher(kafka_producer: KafkaProducer):
+    """Publish producer heartbeat to Kafka every 10 seconds."""
+    log.info(f"Heartbeat publisher started → topic: {TOPIC_HEARTBEAT}")
+    while True:
+        try:
+            payload = {
+                "ts"         : int(time.time() * 1000),   # epoch ms
+                "source"     : "bybit-producer",
+                "symbol"     : SYMBOL,
+                "ob_msgs"    : stats["ob_msgs"],
+                "trade_msgs" : stats["trade_msgs"],
+                "ob_connected"   : stats["ob_connected"],
+                "trade_connected": stats["trade_connected"],
+                "uptime_sec" : round(time.time() - stats["started_at"], 0),
+            }
+            kafka_producer.send(TOPIC_HEARTBEAT, value=payload)
+        except Exception as e:
+            log.warning(f"Heartbeat publish failed: {e}")
+        time.sleep(10)
 
 # =============================================================================
 # ORDERBOOK WEBSOCKET PRODUCER (with reconnect loop)
@@ -495,9 +524,11 @@ def main():
     kafka = connect_kafka(KAFKA_BOOTSTRAP)
 
     # Step 2 — Background threads
-    threading.Thread(target=stats_logger,    daemon=True, name="stats").start()
-    threading.Thread(target=stall_watchdog,  daemon=True, name="stall-watchdog").start()
+    threading.Thread(target=stats_logger,      daemon=True, name="stats").start()
+    threading.Thread(target=stall_watchdog,    daemon=True, name="stall-watchdog").start()
     threading.Thread(target=halt_event_poller, daemon=True, name="halt-poller").start()
+    threading.Thread(target=heartbeat_publisher, args=(kafka,), daemon=True, name="heartbeat").start()
+    log.info("Heartbeat publisher thread started")
 
     # Step 3 — OB WebSocket thread
     ob = OBProducer(kafka)
