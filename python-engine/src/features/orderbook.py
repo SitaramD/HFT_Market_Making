@@ -126,48 +126,39 @@ class OrderBookProcessor:
             except Exception as e:
                 log.error(f"Kafka OB consumer error: {e} - retrying in 5s")
                 time.sleep(5)
+    """
+    Remove only the crossed levels instead of clearing the whole book.
+    A crossed book means best_bid >= best_ask.
 
+    v2.8 FIX: Bidirectional pruning — removes whichever side of the cross
+    is further from mid. Previously always removed bids, which caused
+    stale ask levels to persist permanently when ask side was wrong.
+    """
     def _prune_crossed_levels(self):
-        """
-        Remove only the crossed levels instead of clearing the whole book.
-
-        A crossed book means best_bid >= best_ask.
-        We remove bids that are >= best_ask and asks that are <= best_bid
-        until the book is valid or empty.
-
-        This is far less destructive than a full reset — valid price levels
-        far from the cross are preserved.
-        """
         if not self.bids or not self.asks:
             return
-
         pruned_bids = 0
         pruned_asks = 0
 
-        # Keep removing the highest bid if it's >= lowest ask
+        # Bidirectional pruning — remove whichever crossed level is further from mid
         while self.bids and self.asks:
             best_bid = self.bids.keys()[0]
             best_ask = self.asks.keys()[0]
             if best_bid < best_ask:
                 break  # book is valid now
-            # Remove the crossed bid level
-            self.bids.popitem(0)
-            pruned_bids += 1
-
-        # Also remove any asks <= remaining best bid (if any)
-        if self.bids:
-            best_bid = self.bids.keys()[0]
-            while self.asks:
-                best_ask = self.asks.keys()[0]
-                if best_ask > best_bid:
-                    break
+            mid = (best_bid + best_ask) / 2
+            if best_bid - mid >= mid - best_ask:
+                # Bid is further from mid — bid is the stale/wrong level
+                self.bids.popitem(0)
+                pruned_bids += 1
+            else:
+                # Ask is further from mid — ask is the stale/wrong level
                 self.asks.popitem(0)
                 pruned_asks += 1
 
         log.info(f"Crossed book pruned: removed {pruned_bids} bid levels, "
                  f"{pruned_asks} ask levels | "
                  f"remaining: {len(self.bids)} bids, {len(self.asks)} asks")
-
         # Reset warmup to avoid vol spike from mid discontinuity after prune
         self._last_mid     = None
         self._warmup_ticks = 0

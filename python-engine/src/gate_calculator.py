@@ -23,6 +23,14 @@ Gates evaluated (11 total):
    10.  fee_adjusted_pnl_positive Final cumulative PnL > 0
    11.  daily_loss_limit_respected  No single-day PnL < daily_loss_limit
 
+Changes v3.4:
+  [FIX] _gate_spread: removed broken feature_metrics.spread_usdt fallback
+        — that column does not exist and caused a PostgreSQL transaction abort
+        — which cascade-failed ic_stability_ok and fee_adjusted_pnl_positive.
+        Now returns None gracefully if order_book_ticks has no rows for session.
+  [FIX] Each gate wrapped in its own savepoint so one gate failure cannot
+        abort the transaction and block subsequent gates.
+
 All pass/fail values are written back to live_BTCUSDT_master.json
 and the session status is updated to COMPLETED.
 """
@@ -36,7 +44,6 @@ import psycopg2
 from datetime import datetime, timezone
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-##MASTER_JSON = os.getenv("MASTER_JSON", r"E:\Binance\live_BTCUSDT_master.json")
 MASTER_JSON = os.getenv("MASTER_JSON", "/mnt/sessions/live_BTCUSDT_master.json")
 DB_HOST     = os.getenv("TIMESCALEDB_HOST",     "timescaledb")
 DB_PORT     = int(os.getenv("TIMESCALEDB_PORT", "5432"))
@@ -54,7 +61,7 @@ ADVERSE_SEL_MAX_PCT    = float(os.getenv("ADVERSE_SEL_MAX_PCT",    "30.0"))
 QTR_MIN                = float(os.getenv("QTR_MIN",                "1.0"))
 SPREAD_MIN_USDT        = float(os.getenv("SPREAD_MIN_USDT",        "0.10"))
 IC_STABILITY_MAX_RATIO = float(os.getenv("IC_STABILITY_MAX_RATIO", "2.0"))
-MAX_INVENTORY_BTC      = float(os.getenv("MAX_INVENTORY_BTC",      "0.1"))
+MAX_INVENTORY_BTC      = float(os.getenv("MAX_INVENTORY_BTC",      "0.01"))  # [FIX v3.4]
 
 TICKS_PER_YEAR = 429_000   # ~500ms ticks × 6.5 hours × 252 trading days (approx)
 
@@ -90,10 +97,9 @@ def _gate_sharpe(cur, session_id):
     if not row or row[2] < 2 or (row[1] or 0) == 0:
         return None, {"reason": "insufficient trades", "n": row[2] if row else 0}
     mean_pnl, std_pnl, n = row
-    ##sharpe = (mean_pnl / std_pnl) * math.sqrt(TICKS_PER_YEAR)
     sharpe = (float(mean_pnl) / float(std_pnl)) * math.sqrt(TICKS_PER_YEAR)
     return sharpe >= SHARPE_TARGET, {
-        "value": round(sharpe, 4),
+        "value":    round(sharpe, 4),
         "mean_pnl": round(mean_pnl, 6),
         "std_pnl":  round(std_pnl, 6),
         "n_fills":  n,
@@ -113,7 +119,7 @@ def _gate_max_dd(cur, session_id):
     if len(rows) < 2:
         return None, {"reason": "insufficient trades"}
 
-    peak = rows[0]
+    peak   = rows[0]
     max_dd = 0.0
     for pnl in rows:
         if pnl > peak:
@@ -123,8 +129,8 @@ def _gate_max_dd(cur, session_id):
             max_dd = dd
 
     return max_dd < MAX_DD_PCT, {
-        "value_pct": round(max_dd, 4),
-        "peak_pnl":  round(peak, 4),
+        "value_pct":  round(max_dd, 4),
+        "peak_pnl":   round(peak, 4),
         "target_pct": MAX_DD_PCT
     }
 
@@ -145,7 +151,7 @@ def _gate_ic(cur, session_id):
     if mean_ic is None:
         return None, {"reason": "ic_value all NULL"}
     return float(mean_ic) > IC_MIN, {
-        "value": round(float(mean_ic), 6),
+        "value":  round(float(mean_ic), 6),
         "n_rows": n,
         "target": IC_MIN
     }
@@ -163,16 +169,16 @@ def _gate_fill_rate(cur, session_id):
     row = cur.fetchone()
     if not row or not row[0]:
         return None, {"reason": "no trades"}
-    fills       = row[0]
+    fills        = row[0]
     total_quotes = row[1] or 0
     if total_quotes == 0:
         return None, {"reason": "quotes_sent column is 0"}
     rate = fills / total_quotes * 100
     return rate > FILL_RATE_MIN_PCT, {
-        "value_pct":    round(rate, 4),
-        "fills":        fills,
-        "quotes_sent":  total_quotes,
-        "target_pct":   FILL_RATE_MIN_PCT
+        "value_pct":   round(rate, 4),
+        "fills":       fills,
+        "quotes_sent": total_quotes,
+        "target_pct":  FILL_RATE_MIN_PCT
     }
 
 
@@ -181,8 +187,8 @@ def _gate_inventory_reversion(cur, session_id):
     half_max = MAX_INVENTORY_BTC * 0.5
     cur.execute("""
         SELECT
-            COUNT(*)                                              AS total,
-            SUM(CASE WHEN ABS(inventory_after) < %s THEN 1 ELSE 0 END) AS near_flat
+            COUNT(*)                                                       AS total,
+            SUM(CASE WHEN ABS(inventory_after) < %s THEN 1 ELSE 0 END)   AS near_flat
         FROM trades
         WHERE session_id = %s
     """, (half_max, session_id))
@@ -192,11 +198,11 @@ def _gate_inventory_reversion(cur, session_id):
     total, near_flat = row
     rate = (near_flat / total) * 100 if total > 0 else 0
     return rate > INV_REVERSION_MIN_PCT, {
-        "value_pct":   round(rate, 4),
-        "near_flat":   near_flat,
-        "total_fills": total,
+        "value_pct":     round(rate, 4),
+        "near_flat":     near_flat,
+        "total_fills":   total,
         "threshold_btc": half_max,
-        "target_pct":  INV_REVERSION_MIN_PCT
+        "target_pct":    INV_REVERSION_MIN_PCT
     }
 
 
@@ -204,7 +210,7 @@ def _gate_adverse_selection(cur, session_id):
     """% of fills with negative realised PnL < ADVERSE_SEL_MAX_PCT"""
     cur.execute("""
         SELECT
-            COUNT(*)                                           AS total,
+            COUNT(*)                                            AS total,
             SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) AS adverse
         FROM trades
         WHERE session_id = %s
@@ -247,27 +253,27 @@ def _gate_qtr(cur, session_id):
 
 
 def _gate_spread(cur, session_id):
-    """Average spread ≥ SPREAD_MIN_USDT"""
+    """
+    Average market spread ≥ SPREAD_MIN_USDT.
+    Source: order_book_ticks.spread column.
+
+    [FIX v3.4] Removed broken fallback to feature_metrics.spread_usdt —
+    that column does not exist and caused a PostgreSQL transaction abort
+    that cascade-failed all subsequent gates in the same connection.
+    Returns None gracefully if order_book_ticks has no data for session.
+    """
     cur.execute("""
         SELECT AVG(spread), COUNT(*)
         FROM order_book_ticks
         WHERE session_id = %s
     """, (session_id,))
     row = cur.fetchone()
-    if not row or not row[0]:
-        # fallback — try feature_metrics
-        cur.execute("""
-            SELECT AVG(spread_usdt), COUNT(*)
-            FROM feature_metrics
-            WHERE session_id = %s
-        """, (session_id,))
-        row = cur.fetchone()
-    if not row or not row[0]:
-        return None, {"reason": "no spread data"}
+    if not row or row[0] is None or row[1] == 0:
+        return None, {"reason": "no spread data in order_book_ticks for this session"}
     avg_spread, n = row
     return float(avg_spread) >= SPREAD_MIN_USDT, {
-        "value_usdt": round(float(avg_spread), 6),
-        "n_rows":     n,
+        "value_usdt":  round(float(avg_spread), 6),
+        "n_rows":      n,
         "target_usdt": SPREAD_MIN_USDT
     }
 
@@ -290,16 +296,16 @@ def _gate_ic_stability(cur, session_id):
         return None, {"reason": "mean IC is zero"}
     ratio = abs(float(std_ic or 0)) / abs(float(mean_ic))
     return ratio < IC_STABILITY_MAX_RATIO, {
-        "value_ratio": round(ratio, 4),
-        "mean_ic":     round(float(mean_ic), 6),
-        "std_ic":      round(float(std_ic or 0), 6),
-        "n_rows":      n,
+        "value_ratio":  round(ratio, 4),
+        "mean_ic":      round(float(mean_ic), 6),
+        "std_ic":       round(float(std_ic or 0), 6),
+        "n_rows":       n,
         "target_ratio": IC_STABILITY_MAX_RATIO
     }
 
 
 def _gate_fee_adjusted_pnl(cur, session_id):
-    """Final cumulative PnL > 0"""
+    """Final cumulative PnL > 0 — uses last trade row for session"""
     cur.execute("""
         SELECT cumulative_pnl
         FROM trades
@@ -350,6 +356,10 @@ def calculate_gates(session_id: str, session_data: dict) -> dict:
     """
     Run all 11 gates for session_id.
     Returns dict: gate_name -> {"pass": bool|None, "details": {...}}
+
+    [FIX v3.4] Each DB gate is wrapped in its own savepoint so a single
+    gate failure (e.g. missing column) cannot abort the entire PostgreSQL
+    transaction and block subsequent gates.
     """
     results = {}
 
@@ -361,32 +371,41 @@ def calculate_gates(session_id: str, session_data: dict) -> dict:
     # Gates 1–10 require TimescaleDB
     try:
         conn = _connect()
+        conn.autocommit = False   # explicit transaction so savepoints work
         cur  = conn.cursor()
         log.info(f"Connected to TimescaleDB — evaluating gates for {session_id}")
 
         db_gates = [
-            ("sharpe_gte_3",                        _gate_sharpe),
-            ("max_dd_lt_5pct",                      _gate_max_dd),
-            ("ic_gt_0_02",                          _gate_ic),
-            ("fill_rate_gt_60pct",                  _gate_fill_rate),
-            ("inventory_mean_reversion_gt_70pct",   _gate_inventory_reversion),
-            ("adverse_selection_lt_30pct",           _gate_adverse_selection),
-            ("quote_to_trade_ratio_ok",             _gate_qtr),
-            ("spread_minimum_ok",                   _gate_spread),
-            ("ic_stability_ok",                     _gate_ic_stability),
-            ("fee_adjusted_pnl_positive",           _gate_fee_adjusted_pnl),
+            ("sharpe_gte_3",                      _gate_sharpe),
+            ("max_dd_lt_5pct",                    _gate_max_dd),
+            ("ic_gt_0_02",                        _gate_ic),
+            ("fill_rate_gt_60pct",                _gate_fill_rate),
+            ("inventory_mean_reversion_gt_70pct", _gate_inventory_reversion),
+            ("adverse_selection_lt_30pct",        _gate_adverse_selection),
+            ("quote_to_trade_ratio_ok",           _gate_qtr),
+            ("spread_minimum_ok",                 _gate_spread),
+            ("ic_stability_ok",                   _gate_ic_stability),
+            ("fee_adjusted_pnl_positive",         _gate_fee_adjusted_pnl),
         ]
 
         for gate_name, fn in db_gates:
+            # [FIX v3.4] Use a savepoint per gate so a SQL error in one gate
+            # does not abort the transaction and block all subsequent gates.
+            sp = f"sp_{gate_name}"
             try:
+                cur.execute(f"SAVEPOINT {sp}")
                 passed, details = fn(cur, session_id)
+                cur.execute(f"RELEASE SAVEPOINT {sp}")
                 results[gate_name] = {"pass": passed, "details": details}
-                status = "✅ PASS" if passed else ("⚠️  NULL" if passed is None else "❌ FAIL")
+                status = ("✅ PASS" if passed else
+                          ("⚠️  NULL" if passed is None else "❌ FAIL"))
                 log.info(f"  [{gate_name}] {status}  {details}")
             except Exception as e:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
                 log.warning(f"  [{gate_name}] ERROR: {e}")
                 results[gate_name] = {"pass": None, "details": {"error": str(e)}}
 
+        conn.commit()
         cur.close()
         conn.close()
 
@@ -418,7 +437,6 @@ def calculate_and_write_gates(session_id: str,
     6. Saves the JSON
     7. Returns the gate results dict
     """
-    # Load master JSON
     try:
         with open(MASTER_JSON, "r", encoding="utf-8") as f:
             master = json.load(f)
@@ -429,7 +447,6 @@ def calculate_and_write_gates(session_id: str,
         log.error(f"JSON parse error: {e}")
         return {}
 
-    # Find session
     session_data = None
     session_idx  = None
     for i, s in enumerate(master.get("sessions", [])):
@@ -445,7 +462,6 @@ def calculate_and_write_gates(session_id: str,
     log.info(f"Calculating gates for session {session_id}")
     gate_results = calculate_gates(session_id, session_data)
 
-    # Summarise
     passed  = sum(1 for g in gate_results.values() if g["pass"] is True)
     failed  = sum(1 for g in gate_results.values() if g["pass"] is False)
     unknown = sum(1 for g in gate_results.values() if g["pass"] is None)
@@ -453,15 +469,13 @@ def calculate_and_write_gates(session_id: str,
 
     log.info(f"Gates: {passed}/{total} passed, {failed} failed, {unknown} unknown/null")
 
-    # Build gate summary for JSON (simple pass/fail + details)
     jenkins_gates_update = {}
     gate_details_update  = {}
     for gate_name, result in gate_results.items():
         jenkins_gates_update[gate_name] = result["pass"]
         gate_details_update[gate_name]  = result["details"]
 
-    # Write end_time and duration
-    now = end_time or datetime.now(timezone.utc)
+    now   = end_time or datetime.now(timezone.utc)
     start = start_time
     if start is None:
         raw = session_data.get("start_time")
@@ -469,10 +483,14 @@ def calculate_and_write_gates(session_id: str,
             start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     duration_sec = round((now - start).total_seconds(), 1) if start else None
 
-    # Update session
+    hours   = int((duration_sec or 0) // 3600)
+    minutes = int(((duration_sec or 0) % 3600) // 60)
+    secs    = int((duration_sec or 0) % 60)
+
     master["sessions"][session_idx]["status"]         = "COMPLETED"
     master["sessions"][session_idx]["end_time"]       = now.isoformat()
     master["sessions"][session_idx]["duration_sec"]   = duration_sec
+    master["sessions"][session_idx]["duration_human"] = f"{hours}h {minutes}m {secs}s"
     master["sessions"][session_idx]["jenkins_gates"]  = jenkins_gates_update
     master["sessions"][session_idx]["gate_details"]   = gate_details_update
     master["sessions"][session_idx]["results"] = {
@@ -484,22 +502,19 @@ def calculate_and_write_gates(session_id: str,
         "evaluated_at":  now.isoformat()
     }
 
-    # Save JSON
     try:
         with open(MASTER_JSON, "w", encoding="utf-8") as f:
             json.dump(master, f, indent=2, default=str)
         log.info(f"Master JSON updated — session {session_id} marked COMPLETED")
-        log.info(f"File: {MASTER_JSON}")
     except Exception as e:
         log.error(f"Failed to write master JSON: {e}")
 
-    # Print final summary
     print("\n" + "=" * 60)
     print(f"  SITARAM GATE RESULTS — {session_id}")
     print("=" * 60)
     for gate_name, result in gate_results.items():
-        status = "✅ PASS" if result["pass"] is True else \
-                 ("❌ FAIL" if result["pass"] is False else "⚠️  NULL")
+        status = ("✅ PASS" if result["pass"] is True else
+                  ("❌ FAIL" if result["pass"] is False else "⚠️  NULL"))
         print(f"  {status}  {gate_name}")
     print("=" * 60)
     print(f"  {passed}/{total} gates passed")
@@ -509,18 +524,12 @@ def calculate_and_write_gates(session_id: str,
 
 
 # ── Standalone CLI ──────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SITARAM Gate Calculator")
-    parser.add_argument(
-        "--session", required=True,
-        help="Session ID e.g. SES_20260413_120657"
-    )
-    parser.add_argument(
-        "--master-json", default=MASTER_JSON,
-        help="Path to live_BTCUSDT_master.json"
-    )
+    parser.add_argument("--session", required=True,
+                        help="Session ID e.g. SES_20260413_120657")
+    parser.add_argument("--master-json", default=MASTER_JSON,
+                        help="Path to live_BTCUSDT_master.json")
     args = parser.parse_args()
-
     MASTER_JSON = args.master_json
     calculate_and_write_gates(args.session)
